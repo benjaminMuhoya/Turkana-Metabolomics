@@ -1,0 +1,908 @@
+---
+title: "Untargeted_Metab"
+author: "BENJAMIN"
+date: "9/20/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+setwd("/Users/bm0211/Documents/AyrolesLab")
+library(tidyverse)
+library(dplyr)
+library(rcompanion)
+library(ggplot2)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(modelsummary)
+library(caret)
+library(ggfortify)
+library(corrr)
+library(ggcorrplot)
+library(car)
+library(proDA)
+library(rio)
+library(reshape2)
+library(readxl)
+library(RColorBrewer)
+##Code for plotting pretty graphs
+ggtheme <- 
+  theme(
+    axis.text.x = element_text(colour='black'),
+    axis.text.y = element_text(colour='black'),
+    panel.background = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.border = element_rect(colour='black', fill=NA),
+    legend.justification = c(1, 0),
+    legend.position = c(0, 1),
+    legend.background = element_rect(colour = NA),
+    legend.key = element_rect(colour = "white", fill = NA),
+    legend.title = element_blank()
+  )
+##Colouring the graphs
+n <- 15
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+pie(rep(1,n), col=sample(col_vector, n))
+```
+
+## LOAD NEEDED DATA and arrange in Injection order
+
+```{r LOAD}
+#1. Metabolomics Excel sheet from Asael
+#2. Sample map
+#3. LifestyleCat
+#4. Biograph
+#5. Anthropocentric
+# read in the HILIC results and remove the columns that are not samples or pooled QC samples
+allData <- as.data.frame( read_xlsx( "~/Documents/AyrolesLab/Turkana 613 samples Dual-neg+pos SUM.xlsx", sheet = "Organized"))
+rownames( allData) <- allData$compoundId
+dataSub <- allData[ , -c( 1:9)] ##Removing the Blanks
+# order the data by injection order (pooled and repeat samples are listed at the end in the original file)
+dataSub.ordered <- dataSub[ , c( 618, 1:25, 619, 26:50, 620, 51:75, 621, 76:100, 622, 101:125, 623, 126:150, 624, 151:175, 625, 176:200, 626, 201:239, 629, 240:264, 630, 265:289, 631, 290:314, 632, 315:339, 633, 340:358, 634, 610:612, 359:380, 635, 381:397, 636, 398:422, 637, 423:447, 638, 448:476, 639, 477:501, 640, 502:526, 641, 527:551, 642, 552:560, 613:617, 561:571, 643, 572:596, 644, 597:609)]
+## Group the Batches and create an Ordered Batch Map
+batchMap <- rbind( data.frame( batch = 1, sample = colnames( dataSub.ordered)[ 1:248]), data.frame( batch = 2, sample = colnames( dataSub.ordered)[ 249:372]), data.frame( batch = 3, sample = colnames( dataSub.ordered)[ 373:416]), data.frame( batch = 4, sample = colnames( dataSub.ordered)[ 417:498]), data.frame( batch = 5.1, sample = colnames( dataSub.ordered)[ 499:586]), data.frame( batch = 5.2, sample = colnames( dataSub.ordered)[ 587:642]))
+batchMap$batch <- factor( batchMap$batch, levels = c( 1, 2, 3, 4, 5.1, 5.2))
+## Create an additional row with the Injection order into the Machine
+order <- batchMap$sample
+batchMap = batchMap %>% 
+  mutate(Run.ID=row_number())
+head(batchMap)
+table(batchMap$Run.ID)
+##ADD METADATA YOU WANT TO USE
+sampleDat <-  import("Lifestyle_CAT_Diet_Upd.csv")
+table(sampleDat$lifestyleCategory)
+sampleMap <- as.data.frame( import("metabolomics_sampleMap_final (1).csv"))
+head(sampleDat)
+dim(sampleDat)
+head(sampleMap)
+dim(sampleMap)
+batchMap_with_Meta <- merge(sampleMap, batchMap, by=2, all = T)
+dim(batchMap_with_Meta)
+batchMap_with_Meta <- unique(merge(batchMap_with_Meta, sampleDat, by="Unique.ID", all.x = T))
+head(batchMap_with_Meta)
+dim(batchMap_with_Meta)
+table(batchMap_with_Meta$lifestyleCategory)
+
+##Writing the ordered metabolites file
+dataSub.ordered = rownames_to_column(dataSub.ordered, var = "Metabolites")
+colnames(dataSub.ordered)
+table(dataSub.ordered$Metabolites[dataSub.ordered$Pool_2==0])
+```
+##Pivoting the Table into Long formart
+```{r LOAD}
+NARROW_dataSub.ordered <- dataSub.ordered %>% 
+  pivot_longer(!Metabolites,
+                    names_to = "indiv.ID",
+                    values_to = "Concentration")
+
+NARROW_dataSub.ordered <- left_join(NARROW_dataSub.ordered, batchMap_with_Meta, by=c('indiv.ID'='metabRunNum'))
+dim(NARROW_dataSub.ordered)
+head(NARROW_dataSub.ordered)
+table(NARROW_dataSub.ordered %>% select(matches("lifestyleCategory")))
+colnames(NARROW_dataSub.ordered)
+
+NARROW_dataSub.ordered_Norm <- NARROW_dataSub.ordered %>%
+  group_by("Metabolites") %>%
+  mutate(med = median(Concentration)) %>%
+  mutate(normIC = Concentration/med) %>%
+  ungroup() %>%
+  mutate(min.val = min(abs(normIC[normIC != 0]))/10) %>%
+  group_by("indiv.ID") %>%
+  mutate(normLogIC = log10((normIC + sqrt(normIC^2 + min.val^2))/2))
+
+str(NARROW_dataSub.ordered_Norm)
+## Time Series Plots to check for Signal Drift in Time
+ggplot(NARROW_dataSub.ordered_Norm, aes(x=Run.ID, y=normLogIC, colour=lifestyleCategory)) + geom_line() + geom_point()
+```
+##ANOVA BETWEEN BATCHES
+```{r}
+coefficients(lm(normLogIC ~ batch,NARROW_dataSub.ordered_Norm))
+pairwise.t.test(NARROW_dataSub.ordered_Norm$normLogIC, NARROW_dataSub.ordered_Norm$batch, p.adjust.method = "bonferroni")
+TukeyHSD( aov( normLogIC ~ batch,NARROW_dataSub.ordered_Norm), "batch")
+plot(normLogIC ~ batch,NARROW_dataSub.ordered_Norm, col=batch, pch=3, cex=.6)
+abline(h = mean(NARROW_dataSub.ordered_Norm$normLogIC), lty=2)
+points(unique(NARROW_dataSub.ordered_Norm$batch), by(NARROW_dataSub.ordered_Norm$normLogIC, NARROW_dataSub.ordered_Norm[, "batch"], mean), pch=19, col=unique(NARROW_dataSub.ordered_Norm$batch))
+```
+
+##Regression
+```{r LOAD}
+##You can group the lifestyles into one category here
+LongTable_NORM <- NARROW_dataSub.ordered_Norm %>% mutate (`lifestyleCategory` = dplyr::recode(`lifestyleCategory` , "Non-pastoralist_Rural" ="RUR", "Urban"="URB", "Pastoralist" ="PAS", "NA"="NA"))
+
+##Median normalization and Log transform
+LongTable_Metabs_Metadata <- LongTable_NORM[!is.na(LongTable_NORM$Unique.ID),]
+LongTable_Metabs_Metadata <- LongTable_Metabs_Metadata[!is.na(LongTable_Metabs_Metadata$lifestyleCategory),]
+head(LongTable_Metabs_Metadata)
+table(LongTable_Metabs_Metadata$lifestyleCategory)
+colnames(LongTable_Metabs_Metadata)
+dim(LongTable_Metabs_Metadata)
+
+##Regressions
+metabolite_lifestyle_regressions = vector("list", length = length(unique(LongTable_Metabs_Metadata$Metabolites)))
+
+names(metabolite_lifestyle_regressions) = unique(LongTable_Metabs_Metadata$Metabolites)
+
+for(current_metabolite in unique(LongTable_Metabs_Metadata$Metabolites)){
+  model = lm(normLogIC ~ lifestyleCategory + Age + Sex + batch,
+             data = dplyr::filter(LongTable_Metabs_Metadata,
+                                  Metabolites == current_metabolite))
+  null_model = lm(normLogIC ~ Age + Sex + batch,
+                  data = dplyr::filter(LongTable_Metabs_Metadata,
+                                       Metabolites == current_metabolite))
+  lrt = anova(model, null_model)
+  metabolite_lifestyle_regressions[[current_metabolite]] <- list(model, null_model, test = lrt, p.value =  lrt$`Pr(>F)`[2], F.value = lrt$`F`[2])
+}
+
+##GETTING THE P VALUES
+head(metabolite_lifestyle_regressions)
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.05/120000)
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> length()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist(breaks = 100)
+
+table(x < 0.001)
+table(x < 0.001/600)
+
+##Extract P-value
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist(breaks = 100)
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.05/120000 |> sum())
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.05/120000)
+CHECDIS <- as.data.frame(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() <0.05/120000)
+view(CHECDIS)
+
+##Extract F-value
+sapply(metabolite_lifestyle_regressions, `[[`, 5)  |> hist(breaks = 100)
+table(sapply(metabolite_lifestyle_regressions, `[[`, 5) |> unlist() > 40 |> sum())
+table(sapply(metabolite_lifestyle_regressions, `[[`, 5) |> unlist() >40)
+Betacheck <- as.data.frame(sapply(metabolite_lifestyle_regressions, `[[`, 5) |> unlist() >40)
+view(Betacheck)
+
+##Write file
+write.csv(Betacheck, file = "CHECDIS.csv") ##Write table with DE_Metabolites and then annotate them manually
+```
+##Boplots with the DE metabolites
+
+```{r LOAD}
+##
+##
+##Plug the metabolites pvalue and betavalue and plot
+Pvalue_Metabs <- import("CHECDIS_log_med.csv")
+Betasover_forty <- import("Betacheck_median_log.csv")
+
+##
+##
+DE_Metabs <- Betasover_forty
+names(DE_Metabs)[1] <- "Metabolite_name"
+head(DE_Metabs)
+head(LongTable_Metabs_Metadata)
+DE_METABS_Alldata <- merge(DE_Metabs, LongTable_Metabs_Metadata, by.x = "Metabolite_name", by.y = "Metabolites", all.x = T)
+dim(DE_METABS_Alldata)
+colnames(DE_METABS_Alldata)
+unique(DE_METABS_Alldata$Annotation)
+DE_METABS_Alldata <- DE_METABS_Alldata[!is.na(DE_METABS_Alldata$lifestyleCategory),]
+DEEEED <- ggplot(DE_METABS_Alldata) + geom_boxplot(aes(x=lifestyleCategory, y=normLogIC, color=Annotation)) + labs(title = "DE Metabolites", x="Lifestyle Category", y="Metabolite concentration (Relative Value) Median centered and log transformed") 
+
+DEEEED + scale_color_manual(values =c("black","#E78AC3","#E6AB02","#BC80BD","#33A02C","red","#386CB0","brown","#FFF2AE","#8DA0CB","#B3CDE3","#BEAED4","pink"))
+
+##Microbiome related
+Microbe <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Cresol sulfate"),]
+ggplot(Microbe) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+Microbe2 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Ginsenoside Rh3 isomer"),]
+ggplot(Microbe2) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+
+
+##Lipid related
+FORlyso <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Lyso-PAF C-18"),]
+ggplot(FORlyso) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+FORlyso2 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "LysoPE(22:1)"),] 
+ggplot(FORlyso2) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+FORlyso3 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "C20:0(Arachidic acid)"),]
+ggplot(FORlyso3) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+FORlyso4 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "PC(17:0/20:4)"),]
+ggplot(FORlyso4) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+
+##Diet related
+dietstuff <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "DL cotinine"),]
+ggplot(dietstuff) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory)) + ggtheme
+
+dietstuff2 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Corosolic acid isomer"),]
+ggplot(dietstuff2) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory))+ ggtheme
+
+dietstuff2 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "magellanine isomer"),]
+ggplot(dietstuff2) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory))+ ggtheme
+
+coffeestuff <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Homostachydrine"),]
+ggplot(coffeestuff) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory))
+  
+##Kidney related
+kidney <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Guanidinosuccinic acid"),]
+ggplot(kidney) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory))+ ggtheme
+kidney2 <- DE_METABS_Alldata[which(DE_METABS_Alldata$Metabolite_name == "Trihydroxycoprostanoic acid"),]
+ggplot(kidney2) + geom_boxplot(aes(x=Metabolite_name, y=normLogIC, color=lifestyleCategory))+ ggtheme
+```
+##Compare replicates
+
+```{r LOAD}
+
+Long_wide <- LongTable_Metabs_Metadata %>% pivot_wider(names_from = "Metabolites", values_from = "Concentration")
+LongTable_for_cor <- select(Long_wide, -c(3,4,5,8,11,12,13,16,17,18,19,29,))
+head(LongTable_for_cor)
+dim(LongTable_for_cor)
+
+LongTable_Corr <- LongTable_for_cor[!is.na(LongTable_for_cor$Unique.ID),]
+colnames(LongTable_Corr)
+LongTable_Corr <- as.data.frame.matrix(LongTable_Corr)
+
+M <- cor(LongTable_Corr, method = c( "spearman"))
+diag( M) <- NA
+
+# get the correlations for technical replicates
+reruns <- LongTable_Metabs_Metadata$indiv.ID[ which( LongTable_Metabs_Metadata$rerun == "yes")]
+
+rerunDF <- NULL
+
+for ( i in reruns) {
+  
+  cors <- data.frame( cor = M[ which( rownames( M) == i), ], rerun = "no", keep = i)
+  cors$rerun[ which( rownames( cors) == gsub( "_2", "", i))] <- c( "yes")
+  
+  percentile <- ecdf( cors$cor)
+  
+  rerunDF <- rbind( rerunDF, data.frame( sample = i, medianCor = median( cors$cor[ which( cors$rerun == "no")], na.rm = T), maxCor = max( cors$cor, na.rm = T), initialRun = cors$cor[ which( cors$rerun == "yes")], quantile = percentile( cors$cor[ which( cors$rerun == "yes")])))
+}
+
+tmpDF <- melt( rerunDF[ , 1:4])
+
+png( "technicalReplicateCorrelations_vsMedianMaxAllSamples.png", width = 8, height = 7, units = "in", res = 300)
+ggplot( tmpDF, aes( x = sample, y = value, color = variable)) + geom_point( size = 3) + theme_bw() + ggtitle( "Technical replicate correlation comparisons") + scale_color_manual( values = c( "blue", "red", "black"))
+dev.off()
+
+# get the correlations for the isogenic biological replicates
+bioreps <- fullDatDF$metabRunNum[ which( fullDatDF$Comments == "reprocess")]
+
+biorepDF <- NULL
+
+for ( i in bioreps) {
+  
+  cors <- data.frame( cor = M[ which( rownames( M) == i), ], rerun = "no", keep = i)
+  UID <- fullDatDF$Unique.ID[ which( fullDatDF$metabRunNum == i)]
+  orig <- fullDatDF$metabRunNum[ which( fullDatDF$Unique.ID == UID & is.na( fullDatDF$Comments))]
+  cors$rerun[ which( rownames( cors) == orig)] <- c( "yes")
+
+  percentile <- ecdf( cors$cor)
+  
+  biorepDF <- rbind( biorepDF, data.frame( sample = i, medianCor = median( cors$cor[ which( cors$rerun == "no")], na.rm = T), maxCor = max( cors$cor, na.rm = T), initialRun = cors$cor[ which( cors$rerun == "yes")], quantile = percentile( cors$cor[ which( cors$rerun == "yes")])))
+}
+
+tmpDF <- melt( biorepDF[ , 1:4])
+
+png( "isoBioReplicateCorrelations_vsMedianMaxAllSamples.png", width = 8, height = 7, units = "in", res = 300)
+ggplot( tmpDF, aes( x = sample, y = value, color = variable)) + geom_point( size = 3) + theme_bw() + ggtitle( "Isogenic biological replicate correlation comparisons") + scale_color_manual( values = c( "blue", "red", "black"))
+dev.off()
+```
+##Detrending by batch
+```{r}
+##BATCH 1
+metab_MetaBatch1 <- subset(metab_Meta, metab_Meta$batch == 1)
+dim(metab_MetaBatch1)
+colnames(metab_MetaBatch1)
+##Detrend
+
+##DETRENDING 
+Run_ID <- metab_MetaBatch1$Run.ID.x
+
+for(pheno in c(colnames(metab_MetaBatch1)[15:ncol(metab_MetaBatch1)])){
+  df <- NULL
+  current_formula = as.formula(paste0("metab_MetaBatch1$`",pheno,"`~ splines::bs(metab_MetaBatch1$Run.ID, 3)"))
+  lmGNG <- lm(formula = current_formula, se = FALSE)
+  predicted <- lmGNG$fitted.values
+  data <- metab_MetaBatch1[,pheno]
+  detrended <- c(data - predicted)
+  df <- data.frame(Run_ID, data, predicted, detrended)
+  colnames(df) <- c("Run_ID", "data", "predicted","detrended")
+  ggplot(df, aes(df$Run_ID, df$detrended)) + geom_point()+ geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), se = FALSE)
+  ggsave(paste0("figures/",gsub(" ", "_", pheno),".jpg"))
+}
+
+
+```
+
+
+##Regression and Box-plot of differentially abundant metabolites
+```{r}
+metab_Meta <-  import("Metab_Metadata.csv")
+metab_Meta <- merge(metab_Meta, fullDatDF, by = "Unique.ID")
+metab_Meta <- metab_Meta[ , -c(8,11,12,645,646,647,648,649,650,652,653,654)]
+metab_Meta <- metab_Meta[, c(1,2,641,642,3,4,5,6,7,9,8,12,10,11,13:640)]
+colnames(metab_Meta)
+view(metab_Meta)
+table(metab_Meta$batch)
+unique(metab_Meta$Run.ID.x)
+
+
+##Median centering
+metab_Meta_median_normalized <- data.matrix(metab_Meta)
+metab_Meta_median_normalized <- median_normalization(metab_Meta_median_normalized[14:645,], spike_in_rows = NULL)
+dim(metab_Meta_median_normalized)
+view(metab_Meta_median_normalized)
+
+
+##Regression
+metab_Meta_median_normalized_FOR_REGRESSION <- as.data.frame(metab_Meta_median_normalized)
+#metab_Meta_median_normalized_FOR_REGRESSION <-metab_Meta_median_normalized_FOR_REGRESSION %>% mutate (`lifestyleCat` = dplyr::recode(`lifestyleCat` , "Non-pastoralist urban" ="URB", "Non-pastoralist rural"="RUR", "Pastoralist" ="PAS", "NA"="NA"))
+
+table(metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat)
+metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat <- as.numeric(as.factor(metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat))
+
+metab_Meta_median_normalized_FOR_REGRESSION[14:645,] <- log(metab_Meta_median_normalized_FOR_REGRESSION[14:645,])
+
+metab_Meta_table_Batch_effects_median <- NULL
+for(i in 18:ncol(metab_Meta_median_normalized_FOR_REGRESSION)){
+  LM_Meta <- lm(metab_Meta_median_normalized_FOR_REGRESSION[, i] ~ metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat + metab_Meta_median_normalized_FOR_REGRESSION$Age + metab_Meta_median_normalized_FOR_REGRESSION$Sex + metab_Meta_median_normalized_FOR_REGRESSION$batch, data = metab_Meta_median_normalized_FOR_REGRESSION)
+  metab_Meta_table_Batch_effects_median <- rbind(metab_Meta_table_Batch_effects_median, data.frame(MetabolitesFound = colnames(metab_Meta_median_normalized_FOR_REGRESSION)[i], est =LM_Meta$coefficients[2], pval = summary(LM_Meta)$coef[2, 4]))
+}
+summary(LM_Meta)
+par(mfrow = c(2, 2))
+plot(LM_Meta)
+par(mfrow = c(2, 2))
+summary(metab_Meta_table_Batch_effects_median)
+##show only significant Pvalues
+metab_Meta_table_Batch_effects_median[ which( metab_Meta_table_Batch_effects_median$pval< 0.05), ]
+metab_Meta_table_Batch_effects_median <- metab_Meta_table_Batch_effects_median %>% mutate( padj = p.adjust( pval, method = "bonferroni"))
+##show only significant Pvalues AFTER BONFERRONI
+metab_Meta_table_Batch_effects_median[ which( metab_Meta_table_Batch_effects_median$padj< 0.05), ]
+
+
+##BOXPLOTS
+library(reshape2)
+library(ggplot2)
+for_boxplot <- metab_Meta_median_normalized_FOR_REGRESSION[, c(10:17,20,21,24,25,30,31,33,39,45,65,73,75,116,149,150,155,156,163,164,168,176,200,201,203,206,213,214,229,247,283,295,324,331,392,400,408,415)]
+colnames(for_boxplot)
+# creating the modified dataframe
+for_boxplot <- melt(for_boxplot, id.vars= "lifestyleCat", measure.vars=c(6:45))
+# creating a plot
+p <- ggplot(for_boxplot) + geom_boxplot(aes(x=lifestyleCat, y=value, color=variable)) + labs(title = "DE Metabolites", x="Lifestyle Category", y="Value (Median centered)")
+p + coord_flip()
+
+```
+
+
+##MORE JUNK :()
+
+```{r LOAD}
+# read in the sample map
+sampleMap <- as.data.frame( read.csv("~/Documents/AyrolesLab/metabolomics_sampleMap_final.csv"))
+
+# make a batch map with data prepared and run, and days in between marked
+batchMap <- rbind( data.frame( batch = 1, sample = colnames( dataSub.ordered)[ 1:248]), data.frame( batch = 2, sample = colnames( dataSub.ordered)[ 249:372]), data.frame( batch = 3, sample = colnames( dataSub.ordered)[ 373:416]), data.frame( batch = 4, sample = colnames( dataSub.ordered)[ 417:498]), data.frame( batch = 5.1, sample = colnames( dataSub.ordered)[ 499:586]), data.frame( batch = 5.2, sample = colnames( dataSub.ordered)[ 587:642]))
+batchMap$batch <- factor( batchMap$batch, levels = c( 1, 2, 3, 4, 5.1, 5.2))
+
+# merge the sample map with the batch map
+fullDatDF <- merge( sampleMap, batchMap, by = 2, all.y = T)
+fullDatDF <- fullDatDF[fullDatDF$checkWithBenja != "yes",]
+
+order <- batchMap$sample
+colnames(fullDatDF)
+# read in the sample sex and lifestyle information and merge
+sampleDat <- read.table( "~/Documents/AyrolesLab/lifestyleCat_sex_POST2021_Updated2022-11-17 (3).txt", sep = "\t", header = T)
+fullDatDF <- unique( merge( fullDatDF, sampleDat[ , c( 1, 2, 3)], by.x = 2, by.y = 1, all.x = T))
+
+# get the data containing age, and glucose measures for the samples
+fullDatDF <- merge(fullDatDF, dataSub.ordered, )
+head(fullDatDF)
+view(fullDatDF)
+colnames(fullDatDF)
+##fullDatDF_to_write <- fullDatDF[, -c(3,4,5,6,8,12,13)]
+##head(fullDatDF_to_write)
+##write.csv(fullDatDF_to_write, file = "fullDatDF.csv")
+```
+
+##Model to correct for batch effects
+
+```{r}
+i <- individuals/samples
+j <- metabolite(x)
+k <- Batch_no
+t <- run_sequence/injection_order
+
+Y^t[i][j][k] = X_mean[j] + Batch_no[j][k] + level[i][j] + sigma^t [j][k]
+
+
+##Create a function 
+function_name <- function(i, j, k){
+  #define values
+  for
+  Y = X_mean[j] + Batch_no[j][k] + level[i][j] + sigma^t [j][k]
+}
+
+```
+
+##regression analysis
+
+```{r}
+##METHOD 1
+Untargeted_Regress_01attempt <- NULL
+for(i in 18:ncol(regressssready)){
+  LM_NomUnT <- lm(regressssready[which(regressssready$Age >0.3), i] ~ lifestyleCat + Age, data = regressssready[which(regressssready$Age >0.3),])
+  Untargeted_Regress_01attempt <- rbind(Untargeted_Regress_01attempt, data.frame(MetabolitesFound = colnames(regressssready)[i], est =LM_NomUnT$coefficients[2], pval = summary(LM_NomUnT)$coef[2, 4]))
+}
+summary(LM_NomUnT)
+par(mfrow = c(2, 2))
+plot(LM_NomUnT)
+par(mfrow = c(2, 2))
+plot(Untargeted_Regress_01attempt)
+summary(Untargeted_Regress_01attempt)
+Untargeted_Regress_01attempt[ which( Untargeted_Regress_01attempt$pval< 0.05), ]
+Untargeted_Regress_01attempt <- Untargeted_Regress_01attempt %>% mutate( padj = p.adjust( pval, method = "bonferroni"))
+##show only significant Pvalues##
+Untargeted_Regress_01attempt[ which( Untargeted_Regress_01attempt$padj< 0.05), ]
+
+##METHOD 2
+ordered_samples <- read.csv("/Users/bm0211/Documents/AyrolesLab/ordered_samples.csv")
+ordered_samples$lifestyleCat[ordered_samples$lifestyleCat == ""] = NA
+ordered_samples$Unique.ID[ordered_samples$Unique.ID == ""] = NA
+
+ordered_samples$lifestyleCat<- as.factor(ordered_samples$lifestyleCat)
+head(ordered_samples)
+
+ordered_samples_withpool <- subset(ordered_samples, ordered_samples$Pooled == 1, select= c(2:12))
+dim(ordered_samples_withpool)
+ordered_samples_withpool %>% select(matches("Pooled")) %>% tail(300)
+
+plot.ts(x=ordered_samples_withpool$ColPos, y =ordered_samples_withpool$concentration)
+
+trend = lm(ordered_samples_withpool$concentration~ordered_samples_withpool$ColPos)
+detrend = residuals(trend)
+plot.ts(detrend)
+
+
+plot.ts(x=ordered_samples$ColPos, y =ordered_samples$concentration)
+trend.all = lm(ordered_samples$concentration~ordered_samples$ColPos)
+detrend.all = residuals(trend.all)
+plot.ts(detrend.all)
+
+
+ordered_samples %>% select(matches("Unique.ID")) %>% tail(200)
+ggplot(ordered_samples, aes(x=ColPos, y =concentration)) + geom_point()
+
+ggplot(ordered_samples, aes(x=concentration, y = ColPos)) + geom_point()+ geom_smooth(formula = y ~ x, method="loess", se=FALSE)
+
+##ordered_samples$lifestyleCat %>% drop_na(ordered_samples$lifestyleCat)
+
+##Diogo Code for Linear model
+
+ordered_samples_nopool <- ordered_samples[!is.na(ordered_samples$Unique.ID),]
+
+
+metabolite_lifestyle_regressions = vector("list", length = length(unique(ordered_samples_nopool$Metabolites)))
+
+names(metabolite_lifestyle_regressions) = unique(ordered_samples_nopool$metabolite)
+
+for(current_metabolite in unique(ordered_samples_nopool$Metabolites)){
+  model = lm(concentration ~ lifestyleCat + Age + Sex + batch,
+             data = dplyr::filter(ordered_samples_nopool,
+                                  metabolite == current_metabolite))
+  null_model = lm(concentration ~ Age + Sex + batch,
+                  data = dplyr::filter(ordered_samples_nopool,
+                                       metabolite == current_metabolite))
+  lrt = anova(model, null_model)
+  metabolite_lifestyle_regressions[[current_metabolite]] <- list(model, null_model, test = lrt, p.value =  lrt$`Pr(>F)`[2])
+}
+
+##GETTING THE P VALUES
+lrt = anova(model, null_model)
+lrt$`Pr(>F)`
+
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.001/600)
+sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.001 |> sum()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> length()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist(breaks = 100)
+
+table(x < 0.001)
+table(x < 0.001/600)
+```
+
+## SCALE AND CHECK FOR NORMALITY
+
+##(Mean centering Function)
+
+```{r NORMALIZATION, echo=TRUE}
+metab_Meta <-  import("Metab_Metadata.csv")
+metab_Meta <- merge(metab_Meta, fullDatDF, by = "Unique.ID")
+metab_Meta <- metab_Meta[ , -c(8,11,12,645,646,647,648,649,650,652,653,654)]
+metab_Meta <- metab_Meta[, c(1,2,641,642,3,4,5,6,7,9,8,12,10,11,13:640)]
+colnames(metab_Meta)
+view(metab_Meta)
+table(metab_Meta$V1)
+
+##Mean centering the data
+center_mean <- function(x) {
+    ones = rep(1, nrow(x))
+    x_mean = ones %*% t(colMeans(x))
+    x - x_mean
+}
+##metab_Meta[,14:642] <- center_mean(metab_Meta[,14:642])
+##for(i in 18:ncol(metab_Meta)) {}
+
+##Median Centering
+metab_Meta_median_normalized <- data.matrix(metab_Meta)
+metab_Meta_median_normalized <- median_normalization(metab_Meta_median_normalized[14:645,], spike_in_rows = NULL)
+dim(metab_Meta_median_normalized)
+view(metab_Meta_median_normalized)
+
+
+##MEDIAN NORMALIZATION recommended coz some peaks can be multiplied in magnitude 
+##Then do log transformation before linear regression 
+##Median intensities of pools across time to see if there is deviation --> pick the top few metabolites and see if there are peak intensity shifts 
+##Check to see if there is a seperate column for the standards intensities (c13 VS c14) and check their median intensities across batches --> for standard normalization 
+## Splines
+##How do you treat metabolites with a zero reading and in individual x has 30,000 
+##merge all the covariates including if we have gene data
+##Density Plot
+##Detrend x axis = Metab level y axis = Column position of pools then use the predict command to get the de-trend values at the end you subtract the real metabolites from the predicted values
+par( mfrow = c( 3, 5))
+for ( i in 15:ncol( metab_Meta)) {
+  plot (density( metab_Meta[ , i]), main = colnames( metab_Meta)[ i]) }
+
+```
+
+##Regression analysis
+
+```{r NORMALIZATION, echo=TRUE}
+## UNTARGETED REGRESSION ANALYSIS FIRST ATTEMPT.
+##Median Normalized regression
+metab_Meta_median_normalized_FOR_REGRESSION <- as.data.frame(metab_Meta_median_normalized)
+
+#metab_Meta_median_normalized_FOR_REGRESSION <-metab_Meta_median_normalized_FOR_REGRESSION %>% mutate (`lifestyleCat` = dplyr::recode(`lifestyleCat` , "Non-pastoralist urban" ="URB", "Non-pastoralist rural"="RUR", "Pastoralist" ="PAS", "NA"="NA"))
+
+table(metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat)
+metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat <- as.numeric(as.factor(metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat))
+
+metab_Meta_median_normalized_FOR_REGRESSION[14:645,] <- log(metab_Meta_median_normalized_FOR_REGRESSION[14:645,])
+
+metab_Meta_table_Batch_effects_median <- NULL
+for(i in 18:ncol(metab_Meta_median_normalized_FOR_REGRESSION)){
+  LM_Meta <- lm(metab_Meta_median_normalized_FOR_REGRESSION[, i] ~ metab_Meta_median_normalized_FOR_REGRESSION$lifestyleCat + metab_Meta_median_normalized_FOR_REGRESSION$Age + metab_Meta_median_normalized_FOR_REGRESSION$Sex + metab_Meta_median_normalized_FOR_REGRESSION$batch, data = metab_Meta_median_normalized_FOR_REGRESSION)
+  metab_Meta_table_Batch_effects_median <- rbind(metab_Meta_table_Batch_effects_median, data.frame(MetabolitesFound = colnames(metab_Meta_median_normalized_FOR_REGRESSION)[i], est =LM_Meta$coefficients[2], pval = summary(LM_Meta)$coef[2, 4]))
+}
+summary(LM_Meta)
+par(mfrow = c(2, 2))
+plot(LM_Meta)
+par(mfrow = c(2, 2))
+summary(metab_Meta_table_Batch_effects_median)
+##show only significant Pvalues
+metab_Meta_table_Batch_effects_median[ which( metab_Meta_table_Batch_effects_median$pval< 0.05), ]
+metab_Meta_table_Batch_effects_median <- metab_Meta_table_Batch_effects_median %>% mutate( padj = p.adjust( pval, method = "bonferroni"))
+##show only significant Pvalues AFTER BONFERRONI
+metab_Meta_table_Batch_effects_median[ which( metab_Meta_table_Batch_effects_median$padj< 0.05), ]
+
+```
+
+##BOX PLOT SOME OF THE METABOLITES
+
+```{r}
+library(reshape2)
+library(ggplot2)
+for_boxplot <- metab_Meta_median_normalized_FOR_REGRESSION[, c(10:17,20,21,24,25,30,31,33,39,45,65,73,75,116,149,150,155,156,163,164,168,176,200,201,203,206,213,214,229,247,283,295,324,331,392,400,408,415)]
+colnames(for_boxplot)
+# creating the modified dataframe
+for_boxplot <- melt(for_boxplot, id.vars= "lifestyleCat", measure.vars=c(6:45))
+# creating a plot
+p <- ggplot(for_boxplot) + geom_boxplot(aes(x=lifestyleCat, y=value, color=variable)) + labs(title = "DE Metabolites", x="Lifestyle Category", y="Value (mean centered)")
+p + coord_flip()
+
+```
+
+## DATA TRANSFORMATION SCALING OPTIONS
+
+```{r NORMALIZATION, echo=TRUE}
+## LOG TRANSFORMATION SCALING
+Log_Orgtransposed = as.data.frame(log(OrgTransposed))
+par( mfrow = c( 3, 5))
+for ( i in 2:ncol( Log_Orgtransposed)) {
+  plot (density(Log_Orgtransposed[ , i]), main = colnames( Log_Orgtransposed)[ i]) }
+## z-scale Standardization MANUALLY APPLY A FORMULA
+Zscale_OrgTrans = as.data.frame(sapply(OrgTransposed, function(x) (x-min(x))/(max(x)-min(x))))
+par( mfrow = c( 3, 5))
+for ( i in 2:ncol( Zscale_OrgTrans)) {
+  plot (density( Zscale_OrgTrans[ , i]), main = colnames( Zscale_OrgTrans)[ i]) }
+## LOG-10 TRANSFORMATION
+Log10_Orgtransposed = as.data.frame(log10(OrgTransposed))
+par( mfrow = c( 3, 5))
+for ( i in 2:ncol( Log_Orgtransposed)) {
+  plot (density(Log_Orgtransposed[ , i]), main = colnames( Log_Orgtransposed)[ i]) }
+```
+
+## formatting the WHOLE Metabolomics Data TO GET AN UPDATED BIOGRAPH WITH 2023 DATA
+
+```{r}
+
+lifecate = read.table( "~/Documents/lifestyleCat_sex_2022-08-10.txt", sep = "\t", header = T)
+metabolomics_sampleMap <- read_csv("/Users/bm0211/Documents/AyrolesLab/metabolomics_sampleMap_final (1).csv")
+
+##biograph dat
+biograph <- as.data.frame(read.csv("/Users/bm0211/Documents/AyrolesLab/Biograph.csv"))
+biograph$Unique.ID <- as.Date(biograph$Unique.ID, format = "%m/%d/%y")
+biograph <- biograph %>%
+  unite("Unique.ID", 1:3, sep= "_", 
+        remove = FALSE)
+biograph <- biograph[, c(1,5,11,13,14,15,6)]
+head(biograph)
+
+##2023 Biograph data
+Biograph_2023 <-read.csv("Biograph2023.csv")
+Biograph_2023 <-Biograph_2023[, c(3,4,5,8,12,18,14,20,24)]
+Biograph_2023$Date <- as.Date(Biograph_2023$Date, format = "%m/%d/%y")
+Biograph_2023 <- Biograph_2023 %>%
+  unite("Unique.ID", 1:3, sep= "_", 
+        remove = TRUE)
+head(Biograph_2023)
+dim(Biograph_2023)
+
+##Merge datasets
+biograph <- rbind(biograph, Biograph_2023)
+head(biograph)
+dim(biograph)
+
+Agedata <- biograph
+Combodf1 <- merge(metabolomics_sampleMap, Agedata, by ="Unique.ID")
+Combodf2 <- merge(Combodf1, lifecate, by="Unique.ID")
+
+OrgTransposed <- read.csv("~/Documents/AyrolesLab/OrgTransposed.csv")
+names(OrgTransposed)[1] <- "Run.ID"
+names(Combodf2)[2] <- "Run.ID"
+
+OrgTransposed_WITHmetadata <- merge(Combodf2, OrgTransposed, by ="Run.ID", all.x = T, all.y = T)
+##write.csv(OrgTransposed_WITHmetadata, file = "Metab_Metadata.csv")
+##After this, edit the file manually in excel to remove samples in the "check with Benja" columnn and rows that are not needed
+```
+
+##correlation between Field Glucose and Metabolomics Glucose (absolute quantification)
+
+```{r}
+##Merge Absolute count Data and the Metadata needed
+Glucanalysis <- fullDatDF[, c(1,2,13)]
+dim(Glucanalysis)
+Glucanalysis <- drop_na(Glucanalysis)
+dim(Glucanalysis)
+AbsQuant_Metab <- read.table( "~/Documents/AyrolesLab/metabolomics_absQuant (3).txt", sep = "\t", header = T)
+Glucanalysis <- merge(Glucanalysis, AbsQuant_Metab, by.x = 2, by.y = "metabRunNum")
+names(Glucanalysis)[3] <- "field_Glucose"
+Glucanalysis <- Glucanalysis[!(Glucanalysis$field_Glucose == "NaN"),]
+head(Glucanalysis)
+dim(Glucanalysis)
+unique(Glucanalysis$field_Glucose)
+colnames(Glucanalysis)
+
+##Get the metabolomics glucose and Field Glucose on the same scale (mg/dL)
+Glucanalysis <- Glucanalysis[,c(1,3,8)]
+x <- Glucanalysis$Glucose
+Glucose_Calculated <- x * 18
+Glucanalysis <- cbind(Glucanalysis, Glucose_Calculated)
+head(Glucanalysis)
+##density plot & Mean centering of the data
+Glucanalysis[,2:4] <- center_mean(Glucanalysis[,2:4])
+##Density Plot
+par( mfrow = c( 3, 5))
+for ( i in 2:ncol( Glucanalysis)) {
+  plot (density( Glucanalysis[ , i]), main = colnames( Glucanalysis)[ i]) }
+
+##Scatterplot with colors
+
+ggplot(Glucanalysis_binded, aes(x = field_Glucose, y = Glucose_Calculated, col = Colorgroup)) + geom_line()
+
+x <- Glucanalysis$field_Glucose
+y <- Glucanalysis$Glucose_Calculated
+plot(x, y, col="blue")
+abline(lm(x~y), col = "red")
+lines(lowess(y,x), col = "blue")
+
+scatterplot(field_Glucose~Glucose_Calculated, data=Glucanalysis_binded, xlab = "field", ylab = "Metab_Gluc")
+
+##correlation analysis
+Corr <- cor(x, y)
+plot(x, y, col="light blue")
+points(x, y, col="light blue", pch =8)
+text(paste("Correlation:", round(Corr, 4)), x = 0, y = 0)
+
+glu_glu <- cor.test(Glucanalysis_binded$field_Glucose, Glucanalysis_binded$Glucose_Calculated, method = "pearson")
+glu_glu
+```
+
+## REGRESSION ANALYSIS & Summary of Model + P-Values + Correction = SUCCESSFUL!!!
+
+```{r}
+## UNTARGETED REGRESSION ANALYSIS FIRST ATTEMPT. 
+Untargeted_Regress_01attempt <- NULL
+for(i in 18:ncol(regressssready)){
+  LM_NomUnT <- lm(regressssready[which(regressssready$Age >0.3), i] ~ lifestyleCat + Age, data = regressssready[which(regressssready$Age >0.3),])
+  Untargeted_Regress_01attempt <- rbind(Untargeted_Regress_01attempt, data.frame(MetabolitesFound = colnames(regressssready)[i], est =LM_NomUnT$coefficients[2], pval = summary(LM_NomUnT)$coef[2, 4]))
+}
+summary(LM_NomUnT)
+par(mfrow = c(2, 2))
+plot(LM_NomUnT)
+par(mfrow = c(2, 2))
+plot(Untargeted_Regress_01attempt)
+summary(Untargeted_Regress_01attempt)
+Untargeted_Regress_01attempt[ which( Untargeted_Regress_01attempt$pval< 0.05), ]
+Untargeted_Regress_01attempt <- Untargeted_Regress_01attempt %>% mutate( padj = p.adjust( pval, method = "bonferroni"))
+##show only significant Pvalues##
+Untargeted_Regress_01attempt[ which( Untargeted_Regress_01attempt$padj< 0.05), ]
+
+```
+
+## Missingness and dataframe from Diogo
+
+```{r}
+Missingness <- read.csv("~/Documents/AyrolesLab/missingness.csv")
+ggplot(Missingness, aes(x=Missingness$missingness)) + geom_bar(color="red") + labs(title = "Missingness", x="missingness value", y="Count")
+barplot(Missingness$missingness)
+```
+
+##PIVOTED TABLE Regression analysis
+
+```{r}
+ordered_samples <- read.csv("/Users/bm0211/Documents/AyrolesLab/ordered_samples.csv")
+ordered_samples$lifestyleCat[ordered_samples$lifestyleCat == ""] = NA
+ordered_samples$Unique.ID[ordered_samples$Unique.ID == ""] = NA
+view(ordered_samples)
+ordered_samples$lifestyleCat<- as.factor(ordered_samples$lifestyleCat)
+head(ordered_samples)
+table(ordered_samples$Metabolites)
+
+##ordered_samples$lifestyleCat %>% drop_na(ordered_samples$lifestyleCat)
+
+##Diogo Code for Linear model
+ordered_samples_nopool <- ordered_samples[!is.na(NARROW_dataSub.ordered$Unique.ID),]
+
+metabolite_lifestyle_regressions = vector("list", length = length(unique(ordered_samples_nopool$metabolite)))
+
+names(metabolite_lifestyle_regressions) = unique(ordered_samples_nopool$metabolite)
+
+for(current_metabolite in unique(ordered_samples_nopool$metabolite)){
+  model = lm(concentration ~ lifestyleCat + Age + Sex + batch, 
+             data = dplyr::filter(ordered_samples_nopool, 
+                                  metabolite == current_metabolite))
+  null_model = lm(concentration ~ Age + Sex + batch, 
+                  data = dplyr::filter(ordered_samples_nopool, 
+                                       metabolite == current_metabolite))
+  lrt = anova(model, null_model)
+  metabolite_lifestyle_regressions[[current_metabolite]] <- list(model, null_model, test = lrt, p.value =  lrt$`Pr(>F)`[2])
+}
+
+##GETTING THE P VALUES
+lrt = anova(model, null_model)
+lrt$`Pr(>F)`
+
+MetabTable_1 <- table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.001/600)
+View(MetabTable_1)
+metabolite_lifestyle_regressions[which( metabolite_lifestyle_regressions < 0.05), ]
+
+sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.001 |> sum()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> length()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist(breaks = 100)
+
+table(x < 0.001)
+table(x < 0.001/600)
+```
+
+##Trying out Linear model
+
+```{r}
+###Old way of linear model
+  LM_PIVOT_table <- lm(ordered_samples[which(ordered_samples$Uni), i] ~ lifestyleCat + Age + batch, data = ordered_samples[which(ordered_samples$Unique.ID >0),])
+  Orderedsamples_regression <- rbind(Orderedsamples_regression, data.frame(MetabolitesFound = colnames(ordered_samples)[i], est =LM_PIVOT_table$coefficients[2], pval = summary(LM_PIVOT_table)$coef[2, 4]))
+summary(LM_PIVOT_table)
+par(mfrow = c(2, 2))
+plot(LM_PIVOT_table)
+par(mfrow = c(2, 2))
+plot(Orderedsamples_regression)
+summary(Orderedsamples_regression)
+Orderedsamples_regression[ which( Orderedsamples_regression$pval< 0.05), ]
+Orderedsamples_regression <- Orderedsamples_regression %>% mutate( padj = p.adjust( pval, method = "bonferroni"))
+##show only significant Pvalues##
+Orderedsamples_regression[ which( Orderedsamples_regression$padj< 0.05), ]
+```
+
+##THE Long format table and regression filtering
+```{r}
+
+##This one worked
+##Diogo Code for Linear model
+
+LongTable_Metabs_Metadata <-LongTable_Metabs_Metadata %>% mutate (`lifestyleCategory` = dplyr::recode(`lifestyleCategory` , "Non-pastoralist_Rural" ="RUR", "Urban"="URB", "Pastoralist" ="RUR", "NA"="NA"))
+
+LongTable_Metabs_Metadata <- NARROW_dataSub.ordered[!is.na(NARROW_dataSub.ordered$Unique.ID),]
+head(LongTable_Metabs_Metadata)
+table(LongTable_Metabs_Metadata$lifestyleCategory)
+colnames(LongTable_Metabs_Metadata)
+
+metabolite_lifestyle_regressions = vector("list", length = length(unique(LongTable_Metabs_Metadata$Metabolites)))
+
+names(metabolite_lifestyle_regressions) = unique(LongTable_Metabs_Metadata$Metabolites)
+
+for(current_metabolite in unique(LongTable_Metabs_Metadata$Metabolites)){
+  model = lm(Concentration ~ lifestyleCategory + Age + Sex + batch,
+             data = dplyr::filter(LongTable_Metabs_Metadata,
+                                  Metabolites == current_metabolite))
+  null_model = lm(Concentration ~ Age + Sex + batch,
+                  data = dplyr::filter(LongTable_Metabs_Metadata,
+                                       Metabolites == current_metabolite))
+  lrt = anova(model, null_model)
+  metabolite_lifestyle_regressions[[current_metabolite]] <- list(model, null_model, test = lrt, p.value =  lrt$`Pr(>F)`[2])
+}
+
+##GETTING THE P VALUES
+lrt = anova(model, null_model)
+lrt$`Pr(>F)`
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.05/120000)
+table(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() < 0.001 |> sum())
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> length()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist()
+sapply(metabolite_lifestyle_regressions, `[[`, 4)  |> hist(breaks = 100)
+
+table(x < 0.001)
+table(x < 0.001/600)
+
+CHECDIS <- as.data.frame(sapply(metabolite_lifestyle_regressions, `[[`, 4) |> unlist() <0.05/120000)
+dim(CHECDIS)
+view(CHECDIS)
+write.csv(CHECDIS, file = "CHECDIS.csv")
+
+##
+##
+DE_Metabs <- import("Bonferoni_Metabs_TODAY.csv")
+names(DE_Metabs)[1] <- "Metabolite_name"
+head(DE_Metabs)
+head(LongTable_Metabs_Metadata)
+DE_METABS_Alldata <- merge(DE_Metabs, LongTable_Metabs_Metadata, by.x = "Metabolite_name", by.y = "Metabolites", all.x = T)
+dim(DE_METABS_Alldata)
+colnames(DE_METABS_Alldata)
+unique(DE_METABS_Alldata$Annotation)
+DE_METABS_Alldata <- DE_METABS_Alldata[!is.na(DE_METABS_Alldata$lifestyleCategory),]
+DEEEED <- ggplot(DE_METABS_Alldata) + geom_boxplot(aes(x=lifestyleCategory, y=Concentration, color=Annotation)) + labs(title = "DE Metabolites", x="Lifestyle Category", y="Metabolite concentration (Relative Value) Median centered and log transformed")
+
+DEEEED + scale_color_manual(values =c("black","#E78AC3","#E6AB02","#BC80BD","#33A02C","red","#386CB0","brown","#FFF2AE","#8DA0CB","#B3CDE3","#BEAED4","pink"))
+
+
+Meta_analysis_data$color = sample(col_vector, n)
+TSIMANE_NAMES = c("Tsimane")
+TURKANA_NAMES = c("Rural Turkana", "Urban Turkana")
+SHUAR_NAMES = c("Shuar Rural Women", "Shuar Urban Women")
+NHANES_NAMES = c("US General Population")
+INUITS_NAMES = c("Inuits CANHR Overall")
+Meta_analysis_data$color = "Other Populations"
+Meta_analysis_data[which(Meta_analysis_data$Study_Pop %in% TSIMANE_NAMES),]$color = "Tsimane"
+Meta_analysis_data[which(Meta_analysis_data$Study_Pop %in% TURKANA_NAMES),]$color = "Turkana"
+##Meta_analysis_data[which(Meta_analysis_data$Study_Pop %in% SHUAR_NAMES),]$color ="Shuar"
+Meta_analysis_data[which(Meta_analysis_data$Study_Pop %in% NHANES_NAMES),]$color ="US General Pop"
+Meta_analysis_data[which(Meta_analysis_data$Study_Pop %in% INUITS_NAMES),]$color ="INUITS"
+```
+
+
+```
