@@ -4,9 +4,9 @@ setwd("/Users/bm0211/RegEx/Water_Energy/2025_Metabolomic_Analysis/")
 library(tidyr)
 library(stringr)
 library(ggplot2)
+library(ggrepel)
 library(rio)
 library(tidyverse)
-library(MetaboAnalystR)
 library(openxlsx)
 library(tibble)
 library(dplyr)
@@ -15,7 +15,7 @@ library(dplyr)
 #2. Sample map
 #3. Latest Frozen_Data by Kristina
 # read in the HILIC results and remove the columns that are not samples or pooled QC samples
-allData <- as.data.frame(import( "Turkana 613 samples Dual-neg+pos SUM.xlsx", sheet = "Organized"))
+allData <- as.data.frame(import( "HILIC_raw_from_Asael.xlsx", sheet = "Organized"))
 head(allData)
 rownames( allData) <- allData$compoundId
 dataSub <- allData[ , -c( 1:9)] ##Removing the Blanks
@@ -30,32 +30,90 @@ batchMap = batchMap %>%
   mutate(Run.ID=row_number())
 head(batchMap)
 table(batchMap$Run.ID)
-##ADD METADATA YOU WANT TO USE - Use Updated Frozen data Each time
-All_data <- import("/Users/Bm0211/RegEx/Water_Energy/THGP_database_TurkanaOnly_corrected_merged_2025-01-13.txt")
+## ADD METADATA YOU WANT TO USE - Use Updated Frozen data Each time
+All_data <- import("THGP_database_TurkanaOnly_corrected_merged_2025-01-28.txt")
 dim(All_data)
-##Choose whatever Metadata you want to work with given its a list of ~900 columns by now
-colnames(All_data)
-Meta_ONLY <- All_data %>% dplyr::select(c("Unique.ID", "Age", "Sex", "Sampling.location", "Tribe", "MW_scores_h_sol_trim", "MW_scores_lifestyle","Chapati.yes.no", "BMI", "Non.HDL.mg.dL", "LDL.HDL.ratio", "TC.HDL.ratio", "LDL.cholesterol.mg.dL", "Triglycerides.mg.dL", "HDL.cholesterol.mg.dL", "Total.cholesterol.mg.dL.", "Occupation", "Main.subsistence.activity"))
-head(Meta_ONLY)
-##sample Map
+## Choose whatever Metadata you want to work with
+Meta_ONLY <- All_data %>% dplyr::select(c("Unique.ID","MW_scores_h_sol_trim", "MW_scores_lifestyle", "Main.subsistence.activity", "Age", "Sex"))
+## Sample Map
 sampleMap <- as.data.frame(import("/Users/bm0211/Documents/AyrolesLab/metabolomics_sampleMap_final.csv"))
-##Merge Map and Unique.ID data 
+## Merge Map and Unique.ID data 
 batchMap_with_Meta <- merge(sampleMap, batchMap, by=2, all = T)
 batchMap_with_Meta <- unique(merge(batchMap_with_Meta, Meta_ONLY, by="Unique.ID", all.x = T))
+batchMap_with_Meta <- dplyr::select(batchMap_with_Meta, -(3:8))
 dim(batchMap_with_Meta)
 colnames(batchMap_with_Meta)
 table(batchMap_with_Meta$MW_scores_h_sol_trim)
-##the ordered metabolites file
+## Ordered metabolites file
 dataSub.ordered = rownames_to_column(dataSub.ordered, var = "Metabolites")
 dim(dataSub.ordered)
-# Pivot and merge the data
+# Pivot and merge the data WITHOUT normalization
 NARROW_dataSub.ordered <- dataSub.ordered %>% 
-  pivot_longer(!Metabolites,
-               names_to = "indiv.ID",
-               values_to = "Concentration")
+  pivot_longer(!Metabolites, names_to = "indiv.ID", values_to = "Concentration")
 # Join HILIC_Data with Meta_data
 NARROW_dataSub.ordered <- left_join(NARROW_dataSub.ordered, batchMap_with_Meta, by = c('indiv.ID' = 'metabRunNum'))
-# Median center and log transform - Exact same method suggested by Rabinowiztz lab (Mike)
+# Separate metadata columns for later merge
+metadata_columns <- NARROW_dataSub.ordered %>%
+  dplyr::select(-Metabolites, -Concentration) %>%
+  distinct(indiv.ID, .keep_all = TRUE)
+# Pivot the data back to wide format using raw concentration values (NO normalization)
+WIDE_dataSub <- NARROW_dataSub.ordered %>%
+  pivot_wider(
+    id_cols = indiv.ID,           # Unique identifier for individuals
+    names_from = Metabolites,     # Use metabolites as column names
+    values_from = Concentration   # Keep raw concentration values
+  )
+# Merge the metadata back into the wide dataset
+WIDE_dataSub_with_metadata <- WIDE_dataSub %>%
+  left_join(metadata_columns, by = "indiv.ID")
+# Check dimensions of the new wide dataset
+dim(WIDE_dataSub_with_metadata)
+colnames(WIDE_dataSub_with_metadata)
+# Remove duplicates in Unique.ID, keeping the first occurrence
+WIDE_dataSub_with_metadata <- WIDE_dataSub_with_metadata %>%
+  distinct(Unique.ID, .keep_all = TRUE)
+table(is.na(WIDE_dataSub_with_metadata$MW_scores_lifestyle))
+# Grouping lifestyles
+WIDE_dataSub_with_metadata <- WIDE_dataSub_with_metadata %>%
+  mutate(MW_scores_lifestyle = ifelse(MW_scores_lifestyle == "Urban", "Urban", "Non_Urban")) %>%
+  filter(!is.na(MW_scores_lifestyle))
+table(is.na(WIDE_dataSub_with_metadata$MW_scores_lifestyle))
+# Save the final wide dataset to a CSV
+For_writing <- dplyr::select(WIDE_dataSub_with_metadata, c(630:637,1:629))
+write.csv(For_writing, "HILIC_RAW_DATA_with_covariates.csv", row.names = FALSE)
+# Read the Updated_HMDB_NAMES file # Download from Google Sheets
+updated_hmdb_names <- read.csv("Updated_No_match_Metabo.csv", stringsAsFactors = FALSE)
+head(updated_hmdb_names)
+table(updated_hmdb_names$HMDB)
+# Print only the first 20 duplicated HMDB entries
+updated_hmdb_names %>% 
+  filter(HMDB %in% HMDB[duplicated(HMDB)]) %>%
+  head(13) %>%
+  print()
+# Create a named vector for renaming (excluding NA values)
+rename_vector <- setNames(updated_hmdb_names$HMDB, updated_hmdb_names$Query)
+rename_vector <- rename_vector[!is.na(rename_vector)]  # Remove NA values
+# Rename matching columns in For_writing
+colnames(For_writing) <- ifelse(
+  colnames(For_writing) %in% names(rename_vector),
+  rename_vector[colnames(For_writing)],
+  colnames(For_writing)  # Keep original name if no match
+)
+# Check renamed columns
+colnames(For_writing)
+table(For_writing$MW_scores_lifestyle)
+# Save the final wide dataset with HMDB names
+write.csv(For_writing, "HILIC_RAW_DATA_with_covs_HMDB_column_names.csv", row.names = FALSE)
+
+# Pivot to long format for median centering and log transformation
+NARROW_dataSub.ordered <- WIDE_dataSub_with_metadata %>%
+  pivot_longer(
+    cols = -c(indiv.ID, Unique.ID, MW_scores_h_sol_trim, MW_scores_lifestyle, Main.subsistence.activity, Age, Sex, Run.ID, batch),
+    names_to = "Metabolites",
+    values_to = "Concentration"
+  )
+head(NARROW_dataSub.ordered)
+# Median center and log transform
 NARROW_dataSub.ordered_Norm <- NARROW_dataSub.ordered %>%
   group_by(Metabolites) %>%
   mutate(med = median(Concentration, na.rm = TRUE)) %>%
@@ -63,52 +121,42 @@ NARROW_dataSub.ordered_Norm <- NARROW_dataSub.ordered %>%
   ungroup() %>%
   mutate(min.val = min(abs(normIC[normIC != 0]), na.rm = TRUE) / 10) %>%
   group_by(indiv.ID) %>%
-  mutate(normLogIC = log10((normIC + sqrt(normIC^2 + min.val^2)) / 2))
-# Remove unwanted rows based on Sex column
-NARROW_dataSub.ordered_Norm <- NARROW_dataSub.ordered_Norm[!grepl("Female\\|Female\\|Male|Female\\|Male|Female\\|Male\\|Male", NARROW_dataSub.ordered_Norm$Sex), ]
-# Separate metadata columns for later merge
+  mutate(normLogIC = log10((normIC + sqrt(normIC^2 + min.val^2)) / 2)) %>%
+  ungroup()
+head(NARROW_dataSub.ordered_Norm)
+# Separate metadata columns for later merging
 metadata_columns <- NARROW_dataSub.ordered_Norm %>%
-  dplyr::select(-Metabolites, -normLogIC) %>%  # Exclude columns used in pivoting
-  distinct(indiv.ID, .keep_all = TRUE)  # Ensure one row per individual
-# Pivot the data back to wide format using normLogIC
+  dplyr::select(-Metabolites, -normLogIC) %>%
+  distinct(indiv.ID, .keep_all = TRUE)
+# Pivot back to wide format using normLogIC
 WIDE_dataSub_normLogIC <- NARROW_dataSub.ordered_Norm %>%
   pivot_wider(
-    id_cols = indiv.ID,           # Unique identifier for individuals
-    names_from = Metabolites,     # Use metabolites as column names
-    values_from = normLogIC       # Use normLogIC for the values
+    id_cols = indiv.ID,
+    names_from = Metabolites,
+    values_from = normLogIC
   )
 # Merge the metadata back into the wide dataset
 WIDE_dataSub_with_metadata <- WIDE_dataSub_normLogIC %>%
   left_join(metadata_columns, by = "indiv.ID")
+Second_write <- dplyr::select(WIDE_dataSub_with_metadata, c(630:637, 1:629))
+# Save the transformed dataset
+write.csv(Second_write, "HILIC_DATA_NormLog_plus_Metadata.csv", row.names = FALSE)
+# Confirm lifestyle groups
+table(Second_write$MW_scores_lifestyle)
+# Create datasets for each lifestyle
+Non_Urban_data <- subset(Second_write, MW_scores_lifestyle == "Non_Urban")
+Urban_data <- subset(Second_write, MW_scores_lifestyle == "Urban")
+# Save datasets as CSV files
+write.csv(Non_Urban_data, "HILIC_DATA_NormLog_Non_Urban_data.csv", row.names = FALSE)
+write.csv(Urban_data, "HILIC_DATA_NormLog_Urban_data.csv", row.names = FALSE)
 
-# Check the dimensions of the new wide dataset
-dim(WIDE_dataSub_with_metadata)
 
-# Define the outlier detection and marking function
-mark_outliers <- function(x) {
-  # Calculate the interquartile range (IQR)
-  Q1 <- quantile(x, 0.25, na.rm = TRUE)
-  Q3 <- quantile(x, 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  # Define outlier bounds
-  lower_bound <- Q1 - 1.5 * IQR
-  upper_bound <- Q3 + 1.5 * IQR
-  # Identify outliers
-  is_outlier <- x < lower_bound | x > upper_bound
-  # Mark outliers with "||OUTLIER"
-  x_marked <- ifelse(is_outlier, paste(x, "||OUTLIER"), x)
-  return(x_marked)
-}
-
-# Apply the outlier marking function to metabolite columns (2:629)
-WIDE_dataSub_with_metadata_clean <- WIDE_dataSub_with_metadata %>%
-  mutate(across(2:629, ~ mark_outliers(.)))
-# Save the final wide dataset to a CSV for further use
-write.csv(WIDE_dataSub_with_metadata, "WIDE_dataSub_with_metadata.csv", row.names = FALSE)
-#The above dataset is used for analysis on Metabo-analyst pathway enrichment 
+#The above datasets were made for use online in the Metabo-analyst pathway enrichment 
+##
+## Below, I process the data further and do my analyses. 
 # Select and clean up unnecessary columns - FOR THE DOWNSTREAM ANALYSIS FROM HERE 
-WIDE_dataSub_with_metadata <- dplyr::select(WIDE_dataSub_with_metadata, -c(630, 632:637, 639, 642, 643, 646:659))
-
+WIDE_dataSub_with_metadata <- dplyr::select(WIDE_dataSub_with_metadata, -c(638:641))
+colnames(WIDE_dataSub_with_metadata)
 ##Collecting PC1 after doing a PCA on the residuals of the model
 ## Model; Metabolite ~ MW_scores_h_sol_trim + Age + Sex + batch
 # Initialize a data frame to store residuals
@@ -120,7 +168,7 @@ for (col_index in metabolite_columns) {
   metabolite_name <- colnames(WIDE_dataSub_with_metadata)[col_index]
   # Extract data for the current metabolite
   current_data <- WIDE_dataSub_with_metadata %>%
-    select(indiv.ID, all_of(metabolite_name), MW_scores_h_sol_trim, Age, Sex, batch) %>%
+    dplyr::select(indiv.ID, all_of(metabolite_name), MW_scores_h_sol_trim, Age, Sex, batch) %>%
     rename(Metabolite = all_of(metabolite_name)) %>%
     filter(!is.na(Metabolite) & !is.na(MW_scores_h_sol_trim) & !is.na(Age) & !is.na(Sex) & !is.na(batch))
   # Check if sufficient data is available for regression
@@ -156,24 +204,24 @@ if (nrow(residuals_data) > 0) {
   # Pivot residuals to wide format for PCA
   residuals_wide <- residuals_data %>%
     pivot_wider(names_from = Metabolite, values_from = Residual) %>%
-    left_join(WIDE_dataSub_with_metadata %>% select(indiv.ID, batch), by = "indiv.ID") %>%
+    left_join(WIDE_dataSub_with_metadata %>% dplyr::select(indiv.ID, batch), by = "indiv.ID") %>%
     drop_na() # Remove rows with missing values
   # Ensure only numeric columns are passed to PCA
   metabolite_residuals <- residuals_wide %>%
-    select(-c(indiv.ID, batch)) %>%
+    dplyr::select(-c(indiv.ID, batch)) %>%
     select_if(is.numeric)
   # Perform PCA on residuals
   pca_result <- prcomp(metabolite_residuals, center = TRUE, scale. = TRUE)
   # Extract PCA scores
   pca_scores <- as.data.frame(pca_result$x)
   pca_scores <- pca_scores %>%
-    select(PC1, PC2, PC3) %>%
+    dplyr::select(PC1, PC2, PC3) %>%
     mutate(indiv.ID = residuals_wide$indiv.ID)
   # Add PCA scores to the original dataset
   WIDE_dataSub_with_metadata <- WIDE_dataSub_with_metadata %>%
     left_join(pca_scores, by = "indiv.ID")
   # Save the updated dataset with PCA scores --> This is to use with Metaboanalyst for regression and volcano plot
-  write.csv(WIDE_dataSub_with_metadata, "WIDE_dataSub_with_metadata_with_PCs.csv", row.names = FALSE)
+  write.csv(WIDE_dataSub_with_metadata, "HILIC_data_with_metadata_and_PCs.csv", row.names = FALSE)
   # Plot the variance explained by PC1 and PC2
   pca_variance <- summary(pca_result)$importance[2, 1:3] * 100
   pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = residuals_wide$batch)) +
@@ -196,30 +244,30 @@ if (nrow(residuals_data) > 0) {
 } else {
   message("No valid residuals data for PCA.")
 }
-
 ####
 ##########
 ####
-#Regression with The continuous lifestyle variable h_sol
+#Regression
 WIDE_dataSub_with_metadata$MW_scores_h_sol_trim <- as.numeric(WIDE_dataSub_with_metadata$MW_scores_h_sol_trim)
 ##  For the regression, I ran one model at a time, 
 ## hence you have to switch which terms are in the interacting term of the model each time - do this manually
 ## This will allow you be sure which analysis you do
-## MW_scores_h_sol_trim * Sex + Age + PC1 + batch
-## MW_scores_h_sol_trim * Age + Sex + PC1 + batch
+## MW_scores_h_sol_trim + Age + Sex + PC1 + batch + MW_scores_h_sol_trim:Sex
+## MW_scores_h_sol_trim + Age + Sex + PC1 + batch + MW_scores_h_sol_trim:Age
 # Initialize an empty dataframe to store coefficients
 all_coefficients <- data.frame()
+# Initialize an empty dataframe to store R-squared values
+all_r_squared <- data.frame()
 # Define the range of metabolite columns
 metabolite_columns <- 2:629 ##Always double check with column names
 # Loop through each metabolite and run the regression
 for (metabolite in colnames(WIDE_dataSub_with_metadata)[metabolite_columns]) {
   # Filter data for the current metabolite
   current_data <- WIDE_dataSub_with_metadata %>%
-    select(indiv.ID, MW_scores_h_sol_trim, Age, Sex, batch, PC1, all_of(metabolite)) %>%
+    dplyr::select(indiv.ID, MW_scores_lifestyle, Age, Sex, batch, PC1, all_of(metabolite)) %>%
     rename(Metabolite = all_of(metabolite)) %>%
     filter(
       !is.na(Metabolite),
-      !is.na(MW_scores_h_sol_trim),
       !is.na(Age),
       !is.na(Sex),
       !is.na(PC1)
@@ -240,19 +288,25 @@ for (metabolite in colnames(WIDE_dataSub_with_metadata)[metabolite_columns]) {
     current_data <- current_data %>%
       mutate(batch = as.factor(batch))
     # Run the regression model including interaction terms
-    model <- lm(Metabolite ~ MW_scores_h_sol_trim * Sex + Age + PC1 + batch, data = current_data)
+    model <- lm(Metabolite ~ MW_scores_lifestyle + Sex + Age + PC1 + batch + MW_scores_lifestyle:Sex, data = current_data)
     # Extract coefficients using broom
     temp_results <- broom::tidy(model) %>%
       mutate(
         Metabolite = metabolite,
         N = nrow(current_data) # Add the sample size for the regression
       )
-    # Append results to the master dataframe
+    # Extract R-squared value
+    model_r_squared <- broom::glance(model) %>%
+      dplyr::select(r.squared) %>%
+      mutate(Metabolite = metabolite)
+    # Append results to the master dataframes
     all_coefficients <- bind_rows(all_coefficients, temp_results)
+    all_r_squared <- bind_rows(all_r_squared, model_r_squared)
   } else {
     message(paste("Skipping metabolite:", metabolite, "- insufficient data after removing outliers"))
   }
 }
+#view(all_r_squared)
 # Apply Bonferroni correction to p-values
 all_coefficients <- all_coefficients %>%
   mutate(adjusted_p_values = p.adjust(p.value, method = "bonferroni"))
@@ -272,7 +326,7 @@ p <- ggplot(term_counts, aes(x = reorder(term, Count), y = Count, fill = term)) 
   geom_bar(stat = "identity") +
   geom_text(aes(label = Count), vjust = -0.5, size = 3.5) +
   labs(
-    title = "Count of Signif Metabs by Predictor with Sex_X_H_sol_interaction",
+    title = "Model with lifestyle by Sex interaction",
     x = "Predictor",
     y = "Count of Significant Metabolites"
   ) +
@@ -281,471 +335,219 @@ p <- ggplot(term_counts, aes(x = reorder(term, Count), y = Count, fill = term)) 
 # Print the plot
 print(p)
 # Save the bar plot
-ggsave("Number_of_Signif_Metabs_by_Predictor_model_with_Sex_X_H_sol_interaction.png", plot = p, width = 8, height = 6, dpi = 300)
+ggsave("Number_of_Signif_Metabs_by_Predictor.png", plot = p, width = 8, height = 6, dpi = 300)
 
-# Identify top 50 metabolites by effect size for MW_scores_h_sol_trim
+# Identify top 50 metabolites by effect size for Lifestyle component
 top_50_metabolites_h_sol <- significant_results %>%
-  filter(term == "MW_scores_h_sol_trim") %>%
+  filter(term == "MW_scores_lifestyleUrban") %>%
   arrange(desc(abs(estimate))) %>%
-  head(50)
+  head(10)
 # Create a bar plot for the top 50 metabolites by signed effect size with \(N\) on top
 top_50_plot_signed <- ggplot(top_50_metabolites_h_sol, aes(x = reorder(Metabolite, estimate), y = estimate)) +
   geom_bar(stat = "identity", aes(fill = estimate > 0)) +
   geom_text(aes(label = N), hjust = -0.2, size = 3.5) + # Add \(N\) as text on top of bars
   scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
   labs(
-    title = "Top Metabolites by effect size MW_scores_h_sol_trim_with_sex_interaction",
+    title = "Top Metabolites: 
+    Ordered by lifestyle's effect size on the Metabolite",
     x = "Metabolite",
-    y = "Effect Size"
+    y = "Beta value"
   ) +
   coord_flip() +
   theme_minimal()
 # Print the top 50 plot
 print(top_50_plot_signed)
 # Save the plot
-ggsave("Top_Metabolites_Affected_by_MW_scores_h_sol_trim_with_sex_interaction.png", plot = top_50_plot_signed, width = 8, height = 6, dpi = 300)
+ggsave("Top_Metabolites_Discrete_lifestyle.png", plot = top_50_plot_signed, width = 8, height = 6, dpi = 300)
+#
+# Volcano Plot with the results from the regression combined with a fold change analysis. 
+#
+# Calculate log2 fold change
+all_coefficients <- all_coefficients %>%
+  mutate(log2_fold_change = log2(exp(estimate)))  # Convert regression estimate to log2 fold change
+
+# Define custom fold change threshold for significant metabolites
+fc_threshold <- 0.67  
+
+# Adjust volcano plot with log2 FC
+volcano_data <- all_coefficients %>%
+  filter(term == "MW_scores_lifestyleUrban") %>%
+  mutate(
+    log_p_value = -log10(adjusted_p_values),
+    significant = adjusted_p_values < 0.05 & abs(log2_fold_change) > fc_threshold,
+    regulation = case_when(
+      log2_fold_change > fc_threshold & adjusted_p_values < 0.05 ~ "Upregulated in Urban",
+      log2_fold_change < -fc_threshold & adjusted_p_values < 0.05 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Volcano Plot with different colors for up/down regulation and labels for significant points
+volcano_plot <- ggplot(volcano_data, aes(x = log2_fold_change, y = log_p_value)) +
+  geom_point(aes(color = regulation), alpha = 0.8, size = 3) + 
+  scale_color_manual(values = c("Upregulated in Urban" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  ggrepel::geom_text_repel(
+    data = volcano_data %>% filter(significant), # Only label significant metabolites
+    aes(label = Metabolite),
+    size = 3,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = 15  # Adjust the number of labels shown to reduce clutter
+  ) +
+  labs(
+    title = "Log2 Fold Change of Metabolites Urban vs Non_Urban",
+    x = "Log2 Fold Change",
+    y = "-log10(Adjusted P-Value)"
+  ) +
+  theme_minimal()
+
+# Print and save the plot
+print(volcano_plot)
+ggsave("Volcano_Plot_Regression_plus_FC.png", plot = volcano_plot, width = 8, height = 6, dpi = 300)
+
 
 # Identify top 50 metabolites by effect size for Age
 top_50_metabolites_age <- significant_results_no_intercept %>%
   filter(term == "Age") %>%
   arrange(desc(abs(estimate))) %>%
-  head(50)
+  head(10)
 # Create a bar plot for the top 50 metabolites by signed effect size for Age with \(N\) displayed
 top_50_plot_age <- ggplot(top_50_metabolites_age, aes(x = reorder(Metabolite, estimate), y = estimate)) +
   geom_bar(stat = "identity", aes(fill = estimate > 0)) +
   geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Display \(N\) above the bars
   scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
   labs(
-    title = "Top Metabolites Affected by Age_Model_with sex_X_H_sol_interaction",
+    title = "Top Metabolites Affected by Age",
     x = "Metabolite",
-    y = "Effect Size"
+    y = "Beta value"
   ) +
   coord_flip() +
   theme_minimal()
 # Print the plot for Age
 print(top_50_plot_age)
 # Save the plot for Age
-ggsave("Top_Metabolites_Affected_by_Age_Model_with_sex_interaction.png", plot = top_50_plot_age, width = 8, height = 6, dpi = 300)
+ggsave("Top_Metabolites_Affected_by_Age.png", plot = top_50_plot_age, width = 8, height = 6, dpi = 300)
 
 # Identify top 50 metabolites by effect size for Sex
 top_50_metabolites_sex <- significant_results_no_intercept %>%
   filter(term == "SexMale") %>%
   arrange(desc(abs(estimate))) %>%
-  head(50)
+  head(10)
 # Create a bar plot for the top 50 metabolites by signed effect size for Sex with \(N\) displayed
 top_50_plot_sex <- ggplot(top_50_metabolites_sex, aes(x = reorder(Metabolite, estimate), y = estimate)) +
   geom_bar(stat = "identity", aes(fill = estimate > 0)) +
   geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Display \(N\) above the bars
   scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
   labs(
-    title = "Top Metabolites Affected by Sex_Model_with_sex_X_H_sol_interaction",
+    title = "Top Metabolites Affected by Sex",
     x = "Metabolite",
-    y = "Effect Size"
+    y = "Beta value"
   ) +
   coord_flip() +
   theme_minimal()
 # Print the plot for Sex
 print(top_50_plot_sex)
 # Save the plot for Sex
-ggsave("Top_Metabolites_Affected_by_Sex_model_with_sex_interaction.png", plot = top_50_plot_sex, width = 8, height = 6, dpi = 300)
+ggsave("Top_Metabolites_Affected_by_Sex.png", plot = top_50_plot_sex, width = 8, height = 6, dpi = 300)
 
-# Identify metabolites by effect size for SEX_H_SOL INteraction
-table(significant_results_no_intercept$term)
-Interact_metabs <- significant_results_no_intercept %>%
-  filter(term == "MW_scores_h_sol_trim:SexMale") %>%
+# Filter top 5 metabolites with strongest interaction effects
+top_metabs <- significant_results_no_intercept %>%
+  filter(term == "MW_scores_lifestyleUrban:SexMale") %>%
   arrange(desc(abs(estimate))) %>%
-  head(50)
-# Create a bar plot for the top 50 metabolites by signed effect size for Age with \(N\) displayed
-Interact_metabs_plot <- ggplot(Interact_metabs, aes(x = reorder(Metabolite, estimate), y = estimate)) +
-  geom_bar(stat = "identity", aes(fill = estimate > 0)) +
-  geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Display \(N\) above the bars
-  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
+  head(5)  # Select top 5 metabolites
+# Prepare data for plotting
+interaction_data <- NARROW_dataSub.ordered_Norm %>%
+  filter(Metabolites %in% top_metabs$Metabolite)
+# Create scatter plot with regression lines for each metabolite
+interaction_plot <- ggplot(interaction_data, aes(x = MW_scores_h_sol_trim, y = normLogIC, color = Sex)) +
+  geom_point(alpha = 0.6) +  # Scatter plot
+  geom_smooth(method = "lm", se = TRUE) +  # Regression lines with confidence intervals
+  facet_wrap(~ Metabolites, scales = "free_y") +  # Separate plots for each metabolite
   labs(
-    title = "Metabolites Affected by Sex__H_sol_interaction",
-    x = "Metabolite",
-    y = "Effect Size"
+    title = "Interaction Effect of MW_scores_h_sol_trim and Sex on Metabolites",
+    x = "MW_scores_h_sol_trim",
+    y = "Normalized Log Concentration",
+    color = "Sex"
   ) +
-  coord_flip() +
-  theme_minimal()
-# Print the plot for Age
-print(Interact_metabs_plot)
-# Save the plot for Age
-ggsave("Metabolites Affected by Sex__H_sol_interaction.png", plot = Interact_metabs_plot, width = 8, height = 6, dpi = 300)
+  scale_color_manual(values = c("Male" = "blue", "Female" = "red")) +  # Consistent colors
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5)
+  )
+# Print the plot
+print(interaction_plot)
+# Save the plot as a PNG
+ggsave("Interaction_Effect_Sex_H_sol.png", plot = interaction_plot, width = 10, height = 6, dpi = 300)
+
 ###
 #########
 #############
 #################
 ############
 ########
-#Working with Lifestyle as dicrete
-table(WIDE_dataSub_with_metadata$MW_scores_lifestyle)
-# Combine Pastoralist and PeriUrban into Non_Urban
-WIDE_dataSub_with_metadata <- WIDE_dataSub_with_metadata %>%
+# Compiling names to match more metabolites to HMDB using the Metaboanalyst Platform
+# Here I match HMDB acsession numbers given to me by Asael, and I match them to my data
+# I also have a list of names of those that Metaboanalyst automatically matched and those that it didn't
+# The goal was to increase the number of those that have a HMDB Ascession number 
+
+# Import datasets with UTF-8 encoding
+Metabolites_Asael <- read_csv("Metabolites_Asael.csv", locale = locale(encoding = "UTF-8"))
+No_match_Metabo <- read_csv("Metaboanalyst_match_no_match.csv", locale = locale(encoding = "UTF-8"))
+
+# Function to find exact or close match without modifying characters
+find_best_match <- function(compound_name, match_list) {
+  # Attempt direct matching
+  exact_match <- match_list[match_list == compound_name]
+  if (length(exact_match) > 0) {
+    return(exact_match[1])
+  }
+  # If no exact match, use agrepl for fuzzy matching (95% threshold)
+  fuzzy_matches <- match_list[agrepl(compound_name, match_list, max.distance = 0.05, ignore.case = TRUE)]
+  if (length(fuzzy_matches) > 0) {
+    return(fuzzy_matches[1])  # Take the first close match
+  } else {
+    return(NA)  # No good match found
+  }
+}
+# Identify rows in No_match_Metabo with missing HMDB
+missing_hmdb_rows <- No_match_Metabo %>%
+  filter(is.na(HMDB) | HMDB == "") %>%
+  dplyr::select(Query)
+# Track skipped rows
+skipped_queries <- c()
+# Perform matching for missing HMDB entries
+matched_data <- missing_hmdb_rows %>%
+  rowwise() %>%
   mutate(
-    MW_scores_lifestyle = case_when(
-      MW_scores_lifestyle %in% c("Pastoralist", "PeriUrban") ~ "Non_Urban",
-      MW_scores_lifestyle == "Urban" ~ "Urban",
-      TRUE ~ as.character(MW_scores_lifestyle) # Ensure no loss of other categories
+    Matched_Compound = tryCatch(
+      find_best_match(Query, Metabolites_Asael$Compound),
+      error = function(e) {
+        skipped_queries <<- c(skipped_queries, Query)  # Track problematic row
+        return(NA)  # Skip problematic row
+      }
     )
-  )
-table(WIDE_dataSub_with_metadata$MW_scores_lifestyle)
-# Relevel MW_scores_lifestyle to make Urban the reference group
-WIDE_dataSub_with_metadata <- WIDE_dataSub_with_metadata %>%
-  mutate(MW_scores_lifestyle = factor(MW_scores_lifestyle, levels = c("Urban", "Non_Urban")))
+  ) %>%
+  left_join(Metabolites_Asael, by = c("Matched_Compound" = "Compound")) %>%
+  dplyr::select(Query, Matched_Compound, HMDB) %>%
+  filter(!is.na(HMDB))  # Keep only successful matches
+# Update No_match_Metabo with imputed HMDB values
+No_match_Metabo <- No_match_Metabo %>%
+  left_join(matched_data, by = "Query") %>%
+  mutate(HMDB = coalesce(HMDB.x, HMDB.y)) %>%  # Use existing HMDB if available, else imputed
+  dplyr::select(-HMDB.x, -HMDB.y)  # Remove extra columns
 
-#Regression
-#
-## Initialize an empty dataframe to store coefficients
-all_coefficients <- data.frame()
-# Loop through each metabolite (columns 2:630) and run the regression
-for (metabolite in colnames(WIDE_dataSub_with_metadata)[2:629]) {
-  # Filter data for the current metabolite
-  current_data <- WIDE_dataSub_with_metadata %>%
-    select(indiv.ID, MW_scores_lifestyle, Age, Sex, batch, PC1, all_of(metabolite)) %>%
-    rename(Metabolite = all_of(metabolite)) %>%
-    filter(
-      !is.na(Metabolite),
-      !is.na(MW_scores_lifestyle),
-      !is.na(Age),
-      !is.na(Sex),
-      !is.na(PC1)
-    )
-  # Remove outliers using the IQR method
-  if (nrow(current_data) > 0) {
-    Q1 <- quantile(current_data$Metabolite, 0.25, na.rm = TRUE)
-    Q3 <- quantile(current_data$Metabolite, 0.75, na.rm = TRUE)
-    IQR <- Q3 - Q1
-    lower_bound <- Q1 - 1.5 * IQR
-    upper_bound <- Q3 + 1.5 * IQR
-    current_data <- current_data %>%
-      filter(Metabolite >= lower_bound & Metabolite <= upper_bound)
-  }
-  # Ensure enough data to fit the model
-  if (nrow(current_data) > 6) {
-    # Convert categorical variables to factors
-    current_data <- current_data %>%
-      mutate(
-        batch = as.factor(batch),
-        MW_scores_lifestyle = as.factor(MW_scores_lifestyle)
-      )
-    # Run the regression model including interaction terms
-    model <- lm(Metabolite ~ MW_scores_lifestyle * Sex + Age + PC1 + batch, data = current_data)
-    # Extract coefficients using broom
-    temp_results <- broom::tidy(model) %>%
-      mutate(
-        Metabolite = metabolite,
-        N = nrow(current_data) # Add sample size (N)
-      )
-    # Append results to the master dataframe
-    all_coefficients <- bind_rows(all_coefficients, temp_results)
-  }
-}
-# Apply Bonferroni correction to p-values
-all_coefficients <- all_coefficients %>%
-  mutate(adjusted_p_values = p.adjust(p.value, method = "bonferroni"))
-# Filter to find significant results
-significant_results <- all_coefficients %>%
-  filter(adjusted_p_values < 0.05) %>%
-  arrange(adjusted_p_values)
-# Remove unwanted terms like intercept, PC1, and batch
-significant_results_no_intercept <- significant_results %>%
-  filter(!term %in% c("(Intercept)", "PC1", "batch", "batch1", "batch2", "batch3", "batch4", "batch5.1", "batch5.2"))
-table(significant_results_no_intercept$term)
-colnames(significant_results_no_intercept)
-
-# Plot for Sex
-top_50_metabolites_sex <- significant_results_no_intercept %>%
-  filter(term == "SexMale") %>%
-  arrange(desc(abs(estimate))) %>%
-  head(50)
-top_50_plot_sex <- ggplot(top_50_metabolites_sex, aes(x = reorder(Metabolite, estimate), y = estimate)) +
-  geom_bar(stat = "identity", aes(fill = estimate > 0)) +
-  geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Add N labels above bars
-  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
-  labs(
-    title = "Top Metabolites Affected by Sex",
-    x = "Metabolite",
-    y = "Effect Size"
-  ) +
-  coord_flip() +
-  theme_minimal()
-print(top_50_plot_sex)
-ggsave("Top_Metabolites_Affected_by_Sex.png", plot = top_50_plot_sex, width = 8, height = 6, dpi = 300)
-
-# Plot for Age
-top_50_metabolites_age <- significant_results_no_intercept %>%
-  filter(term == "Age") %>%
-  arrange(desc(abs(estimate))) %>%
-  head(50)
-top_50_plot_age <- ggplot(top_50_metabolites_age, aes(x = reorder(Metabolite, estimate), y = estimate)) +
-  geom_bar(stat = "identity", aes(fill = estimate > 0)) +
-  geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Add N labels above bars
-  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
-  labs(
-    title = "Top Metabolites Affected by Age",
-    x = "Metabolite",
-    y = "Effect Size"
-  ) +
-  coord_flip() +
-  theme_minimal()
-print(top_50_plot_age)
-ggsave("Top_Metabolites_Affected_by_Age.png", plot = top_50_plot_age, width = 8, height = 6, dpi = 300)
-
-# Filter and reverse coefficients for "Urban" effects
-top_50_metabolites_lifestyle <- significant_results_no_intercept %>%
-  filter(term == "MW_scores_lifestyleNon_Urban") %>%  # Use the existing term
-  mutate(estimate = -estimate) %>%  # Reverse the sign of the estimate
-  arrange(desc(abs(estimate))) %>%
-  head(50)
-# Create the bar plot
-top_50_plot_lifestyle <- ggplot(top_50_metabolites_lifestyle, aes(x = reorder(Metabolite, estimate), y = estimate)) +
-  geom_bar(stat = "identity", aes(fill = estimate > 0)) +
-  geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Add N labels above bars
-  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
-  labs(
-    title = "Top Metabolites Affected by Lifestyle (Urban vs Non_Urban)",
-    x = "Metabolite",
-    y = "Effect Size (Urban vs Non_Urban)"
-  ) +
-  coord_flip() +
-  theme_minimal()
-# Print and save the plot
-print(top_50_plot_lifestyle)
-ggsave("Top_Metabolites_Affected_by_Lifestyle_Urban_Adjusted.png", plot = top_50_plot_lifestyle, width = 8, height = 6, dpi = 300)
-
-# Plot for Interaction (Sex x Lifestyle)
-top_50_metabolites_interaction <- significant_results_no_intercept %>%
-  filter(term == "MW_scores_lifestyleNon_Urban:SexMale") %>%
-  arrange(desc(abs(estimate))) %>%
-  head(50)
-top_50_plot_interaction <- ggplot(top_50_metabolites_interaction, aes(x = reorder(Metabolite, estimate), y = estimate)) +
-  geom_bar(stat = "identity", aes(fill = estimate > 0)) +
-  geom_text(aes(label = N), hjust = -0.2, size = 3.5) +  # Add N labels above bars
-  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red"), guide = "none") +
-  labs(
-    title = "Top Metabolites Affected by Lifestyle × Sex Interaction",
-    x = "Metabolite",
-    y = "Effect Size"
-  ) +
-  coord_flip() +
-  theme_minimal()
-print(top_50_plot_interaction)
-ggsave("Top_Metabolites_Affected_by_sex_lifestyle_Interaction.png", plot = top_50_plot_interaction, width = 8, height = 6, dpi = 300)
-
-# Predictor term count plot 
-term_counts <- significant_results_no_intercept %>%
-  group_by(term) %>%
-  summarise(Count = n_distinct(Metabolite), .groups = 'drop') %>%
-  complete(term = unique(significant_results_no_intercept$term), fill = list(Count = 0))
-
-p <- ggplot(term_counts, aes(x = reorder(term, Count), y = Count, fill = term)) +
-  geom_bar(stat = "identity") +
-  geom_text(aes(label = Count), vjust = -0.5, size = 3.5) +
-  labs(
-    title = "Count of Signif Metabos by Model Terms (model_with_Age_lifestyle_interaction)",
-    x = "Model Term",
-    y = "Count of Significant Metabolites"
-  ) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-print(p)
-ggsave("Number_of_Significant_Metabolites_by_Model_Terms_model_with_lifestyle_X_Sex_interaction.png", plot = p, width = 8, height = 6, dpi = 300)
-
-
-##FIGURING OUT THE COMMON ONES ACROSS EVERYTHING
-##Run all the Models and pick the common ones across models 
-# Initialize empty dataframes to store results for lifestyle and sex
-all_lifestyle_results <- list()
-all_sex_results <- list()
-# Define models
-##Filter out the h_sol * Age model because this one has few ones affected by h_sol
-models <- list(
-  "Lifestyle_Discrete_Sex" = "Metabolite ~ MW_scores_lifestyle * Sex + Age + PC1 + batch",
-  "Lifestyle_Discrete_Age" = "Metabolite ~ MW_scores_lifestyle * Age + Sex + PC1 + batch",
-  #"Lifestyle_Continuous_Age" = "Metabolite ~ MW_scores_h_sol_trim * Age + Sex + PC1 + batch",
-  "Lifestyle_Continuous_Sex" = "Metabolite ~ MW_scores_h_sol_trim * Sex + Age + PC1 + batch"
-)
-# Function to remove outliers using IQR
-remove_outliers <- function(data, column) {
-  Q1 <- quantile(data[[column]], 0.25, na.rm = TRUE)
-  Q3 <- quantile(data[[column]], 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  lower_bound <- Q1 - 1.5 * IQR
-  upper_bound <- Q3 + 1.5 * IQR
-  data <- data %>%
-    filter(.data[[column]] >= lower_bound & .data[[column]] <= upper_bound)
-  return(data)
-}
-# Loop through each model
-for (model_name in names(models)) {
-  # Initialize an empty dataframe to store coefficients
-  coefficients <- data.frame()
-  for (metabolite in colnames(WIDE_dataSub_with_metadata)[2:629]) {
-    # Filter data for the current metabolite
-    current_data <- WIDE_dataSub_with_metadata %>%
-      select(indiv.ID, MW_scores_lifestyle, MW_scores_h_sol_trim, Age, Sex, batch, PC1, all_of(metabolite)) %>%
-      rename(Metabolite = all_of(metabolite)) %>%
-      filter(
-        !is.na(Metabolite),
-        !is.na(MW_scores_lifestyle),
-        !is.na(MW_scores_h_sol_trim),
-        !is.na(Age),
-        !is.na(Sex),
-        !is.na(PC1)
-      )
-    # Remove outliers
-    if (nrow(current_data) > 0) {
-      current_data <- remove_outliers(current_data, "Metabolite")
-    }
-    if (nrow(current_data) > 6) {
-      # Convert categorical variables to factors
-      current_data <- current_data %>%
-        mutate(
-          batch = as.factor(batch),
-          MW_scores_lifestyle = as.factor(MW_scores_lifestyle)
-        )
-      # Fit the regression model
-      model <- lm(as.formula(models[[model_name]]), data = current_data)
-      # Extract coefficients
-      temp_results <- broom::tidy(model) %>%
-        mutate(Metabolite = metabolite)
-      coefficients <- bind_rows(coefficients, temp_results)
-    }
-  }
-  
-  # Apply Bonferroni correction and filter significant results
-  coefficients <- coefficients %>%
-    mutate(adjusted_p_values = p.adjust(p.value, method = "bonferroni")) %>%
-    filter(adjusted_p_values < 0.05)
-  # Separate top 50 for lifestyle and sex
-  all_lifestyle_results[[model_name]] <- coefficients %>%
-    filter(str_detect(term, "MW_scores")) %>%
-    arrange(desc(abs(estimate))) %>%
-    head(50)
-  all_sex_results[[model_name]] <- coefficients %>%
-    filter(term == "SexMale") %>%
-    arrange(desc(abs(estimate))) %>%
-    head(50)
+# Save the updated dataset and google the rest Manually on the HMDB website
+write_csv(No_match_Metabo, "Asael_plus_metaboAnalyst.csv")
+# Print skipped queries
+if (length(skipped_queries) > 0) {
+  cat("Skipped rows due to errors in matching:\n")
+  print(skipped_queries)
+} else {
+  cat("No rows were skipped during processing.\n")
 }
 
-# Identify common metabolites across all models
-common_lifestyle <- Reduce(intersect, lapply(all_lifestyle_results, function(x) x$Metabolite))
-common_sex <- Reduce(intersect, lapply(all_sex_results, function(x) x$Metabolite))
-# Function to remove outliers using IQR
-remove_outliers <- function(data, column) {
-  Q1 <- quantile(data[[column]], 0.25, na.rm = TRUE)
-  Q3 <- quantile(data[[column]], 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  lower_bound <- Q1 - 1.5 * IQR
-  upper_bound <- Q3 + 1.5 * IQR
-  data <- data %>%
-    filter(.data[[column]] >= lower_bound & .data[[column]] <= upper_bound)
-  return(data)
-}
-# Function to save plots in 3x3 grids over multiple pages
-save_violin_plots <- function(plots, filename, ncol = 3, nrow = 3) {
-  pdf(filename, width = 11, height = 8.5)
-  for (i in seq(1, length(plots), by = ncol * nrow)) {
-    gridExtra::grid.arrange(
-      grobs = plots[i:min(i + (ncol * nrow - 1), length(plots))],
-      ncol = ncol
-    )
-  }
-  dev.off()
-}
+cat("Successfully created 'Asael_plus_metaboAnalyst.csv' with imputed HMDB values.\n")
 
-# Generate violin plots for common lifestyle metabolites
-if (length(common_lifestyle) > 0) {
-  lifestyle_plots <- lapply(common_lifestyle, function(metabolite) {
-    # Remove outliers for the specific metabolite
-    data <- WIDE_dataSub_with_metadata %>%
-      filter(!is.na(MW_scores_lifestyle), !is.na(!!sym(metabolite))) %>%
-      remove_outliers(column = metabolite)  # Use metabolite name directly
-    # Calculate sample size (N) for each category
-    sample_sizes <- data %>%
-      group_by(MW_scores_lifestyle) %>%
-      summarise(N = n(), .groups = "drop")
-    # Create violin plot
-    ggplot(data, aes(x = MW_scores_lifestyle, y = !!sym(metabolite))) +
-      geom_violin(trim = FALSE, aes(fill = MW_scores_lifestyle), alpha = 0.5) +
-      geom_jitter(width = 0.2, size = 1, alpha = 0.8) +
-      geom_text(data = sample_sizes, aes(x = MW_scores_lifestyle, y = Inf, label = paste0("N=", N)),
-                vjust = 1.5, size = 3, inherit.aes = FALSE) + # Add N to the plot
-      labs(title = metabolite, x = "Lifestyle", y = "Abundance") +
-      theme_minimal()
-  })
-  save_violin_plots(lifestyle_plots, "Lifestyle_Metabolites_Violin_Plots.pdf")
-}
 
-# Generate violin plots for common sex metabolites
-if (length(common_sex) > 0) {
-  sex_plots <- lapply(common_sex, function(metabolite) {
-    # Remove outliers for the specific metabolite
-    data <- WIDE_dataSub_with_metadata %>%
-      filter(!is.na(Sex), !is.na(!!sym(metabolite))) %>%
-      remove_outliers(column = metabolite)  # Use metabolite name directly
-    # Calculate sample size (N) for each category
-    sample_sizes <- data %>%
-      group_by(Sex) %>%
-      summarise(N = n(), .groups = "drop")
-    # Create violin plot
-    ggplot(data, aes(x = Sex, y = !!sym(metabolite))) +
-      geom_violin(trim = FALSE, aes(fill = Sex), alpha = 0.5) +
-      geom_jitter(width = 0.2, size = 1, alpha = 0.8) +
-      geom_text(data = sample_sizes, aes(x = Sex, y = Inf, label = paste0("N=", N)),
-                vjust = 1.5, size = 3, inherit.aes = FALSE) + # Add N to the plot
-      labs(title = metabolite, x = "Sex", y = "Abundance") +
-      theme_minimal()
-  })
-  save_violin_plots(sex_plots, "Sex_Metabolites_Violin_Plots.pdf")
-}
-
-library(ggplot2)
-library(dplyr)
-
-# Filter the dataset for Ginsenoside Rh3 isomer and non-missing lifestyle data
-filtered_data <- WIDE_dataSub_with_metadata %>%
-  filter(!is.na(MW_scores_lifestyle), !is.na(`Ginsenoside Rh3 isomer`))
-
-# Remove outliers for Ginsenoside Rh3 isomer using IQR
-remove_outliers <- function(data, column) {
-  Q1 <- quantile(data[[column]], 0.25, na.rm = TRUE)
-  Q3 <- quantile(data[[column]], 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  lower_bound <- Q1 - 1.5 * IQR
-  upper_bound <- Q3 + 1.5 * IQR
-  data <- data %>%
-    mutate(
-      !!sym(column) := ifelse(
-        data[[column]] < lower_bound | data[[column]] > upper_bound,
-        NA,
-        data[[column]]
-      )
-    )
-  return(data)
-}
-
-filtered_data <- remove_outliers(filtered_data, "Ginsenoside Rh3 isomer")
-
-# Calculate sample sizes for each lifestyle category
-sample_sizes <- filtered_data %>%
-  group_by(MW_scores_lifestyle) %>%
-  summarise(N = n(), .groups = "drop")
-
-# Create the violin plot with jitter points
-violin_plot <- ggplot(filtered_data, aes(x = MW_scores_lifestyle, y = `Ginsenoside Rh3 isomer`)) +
-  geom_violin(trim = FALSE, aes(fill = MW_scores_lifestyle), alpha = 0.5) +
-  geom_jitter(width = 0.2, size = 1, alpha = 0.8) +
-  geom_text(data = sample_sizes, aes(x = MW_scores_lifestyle, y = Inf, label = paste0("N=", N)),
-            vjust = 1.5, size = 3, inherit.aes = FALSE) + # Add sample sizes to the plot
-  labs(title = "Ginsenoside Rh3 Isomer Abundance by Lifestyle",
-       x = "Lifestyle (Urban vs Non-Urban)",
-       y = "Abundance") +
-  theme_minimal()
-
-# Save the plot as a PDF
-ggsave("Ginsenoside_Rh3_isomer_violin_plot.pdf", plot = violin_plot, width = 8, height = 6)
-
-# Display the plot
-print(violin_plot)
